@@ -3,13 +3,6 @@
 Official implementation of the paper **Caesura: SLO-Aware Prefill Scheduling with Release-Aware Rollout for Bursty
 Traffic**, by Zhixiang Zhou, Long Sha, Ming Chen and Yong Liu.
 
-When long prompts arrive in bursts, serving engines such as SGLang miss most time-to-first-token (TTFT) SLOs, because
-requests wait behind one another at admission and within chunked prefill. Caesura serves prefill out of order. It
-formulates prefill scheduling as a multi-step optimal control problem that covers request bypass, preemption, SLO
-awareness and prefix reuse, and approximates it in two stages. In every step, a greedy planner chooses how many prompt
-tokens of each waiting request to prefill, and a release-aware rollout inserts a short decode-only step when decodes
-that are about to finish would put more requests on time. Both run within the engine's step time, inside SGLang and
-without model or kernel changes.
 
 | path | content |
 |---|---|
