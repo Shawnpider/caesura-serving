@@ -1,6 +1,15 @@
 # Caesura
 
-Code and data for *Caesura: SLO-Aware Prefill Scheduling with Release-Aware Rollout for Bursty Traffic*.
+Official implementation of the paper **Caesura: SLO-Aware Prefill Scheduling with Release-Aware Rollout for Bursty
+Traffic**, by Zhixiang Zhou, Long Sha, Ming Chen and Yong Liu.
+
+When long prompts arrive in bursts, serving engines such as SGLang miss most time-to-first-token (TTFT) SLOs, because
+requests wait behind one another at admission and within chunked prefill. Caesura serves prefill out of order. It
+formulates prefill scheduling as a multi-step optimal control problem that covers request bypass, preemption, SLO
+awareness and prefix reuse, and approximates it in two stages. In every step, a greedy planner chooses how many prompt
+tokens of each waiting request to prefill, and a release-aware rollout inserts a short decode-only step when decodes
+that are about to finish would put more requests on time. Both run within the engine's step time, inside SGLang and
+without model or kernel changes.
 
 | path | content |
 |---|---|
@@ -160,3 +169,13 @@ The planner is method `b01`. Caesura adds `b01_ext`.
 The workloads replay L-Eval questions (clock 36× in Table 2, 90× on Qwen3) and a 30% sample of the Mooncake
 tool-agent trace. The token IDs in `gpu/workloads/` encode L-Eval text and keep its GPL-3.0 license
 (`gpu/workloads/LICENSE.LEval`). The Mooncake trace and our code are under Apache-2.0.
+
+## Citation
+
+```bibtex
+@misc{zhou2026caesura,
+  title  = {Caesura: SLO-Aware Prefill Scheduling with Release-Aware Rollout for Bursty Traffic},
+  author = {Zhou, Zhixiang and Sha, Long and Chen, Ming and Liu, Yong},
+  year   = {2026}
+}
+```
