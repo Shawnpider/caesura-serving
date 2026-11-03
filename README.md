@@ -1,7 +1,7 @@
 # Caesura
 
 Official implementation of the paper **Caesura: SLO-Aware Prefill Scheduling with Release-Aware Rollout for Bursty
-Traffic**, by Zhixiang Zhou, Long Sha, Ming Chen and Yong Liu.
+Traffic**.
 
 
 | path | content |
