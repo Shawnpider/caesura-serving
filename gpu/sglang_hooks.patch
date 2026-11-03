@@ -1,0 +1,370 @@
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -12,6 +12,7 @@
+ # limitations under the License.
+ # ==============================================================================
+ """A scheduler that manages a tensor parallel GPU worker."""
++from sglang.srt.managers import b300_persistent_dispatch_rollout_v12 as _PersistentDispatch
+ 
+ import dataclasses
+ import faulthandler
+@@ -1718,6 +1719,7 @@
+     @DynamicGradMode()
+     def event_loop_normal(self):
+         """A normal scheduler loop."""
++        _PersistentDispatch.configure(self)
+         while True:
+             if self.gracefully_exit:
+                 break
+@@ -1753,6 +1755,7 @@
+     @DynamicGradMode()
+     def event_loop_overlap(self):
+         """A scheduler loop that overlaps the CPU processing and GPU computation."""
++        _PersistentDispatch.configure(self)
+         self.result_queue: Deque[
+             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
+         ] = deque()
+@@ -3038,18 +3041,7 @@
+                 else:
+                     self.stash_chunked_request(req)
+ 
+-        if self.chunked_req is not None:
+-            # Move the chunked request out of the batch so that we can merge
+-            # only finished requests to running_batch.
+-            chunked_req_to_exclude.add(self.chunked_req)
+-
+-            # Stash (cache) the previous chunk only when it produced new KV
+-            # beyond what is already cached. A parked chunk (add_chunked_req
+-            # hybrid-SWA early-return) leaves extend_range.end ==
+-            # len(prefix_indices), so there is nothing new to cache and
+-            # stashing would be a no-op.
+-            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
+-                self.stash_chunked_request(self.chunked_req)
++        _PersistentDispatch.stash_round(self, chunked_req_to_exclude)
+ 
+         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
+         if self.enable_hisparse:
+@@ -3104,6 +3096,7 @@
+         if self.dllm_config is not None:
+             new_batch = self.get_new_batch_dllm(running_batch)
+         else:
++            running_batch = _PersistentDispatch.prepare_running(self, running_batch)
+             prefill_plan = self.get_new_batch_prefill(running_batch)
+             new_batch = prefill_plan.batch_to_run
+             running_batch = prefill_plan.running_batch
+@@ -3127,7 +3120,7 @@
+         else:
+             # Run decode (skip for prefill-only batches)
+             if not running_batch.is_empty() and not running_batch.is_prefill_only:
+-                running_batch = self.update_running_batch(running_batch)
++                running_batch = _PersistentDispatch.prepare_decode(self, running_batch)
+                 ret = running_batch if not running_batch.is_empty() else None
+             else:
+                 ret = None
+@@ -3182,6 +3175,45 @@
+         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+ 
+     def _get_new_batch_prefill_raw(
++        self,
++        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
++        running_batch: ScheduleBatch,
++    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
++        # Check if the grammar is ready in the grammar queue
++        return _PersistentDispatch.prefill(
++            self, running_batch, PrefillAdder, ScheduleBatch, PrefillStats, set_time_batch,
++            prefill_delayer_single_pass=prefill_delayer_single_pass)
++
++
++    def _can_schedule_lora_req(
++        self, req: Req, running_loras: set[Optional[str]]
++    ) -> bool:
++        """
++        Check if a LoRA request can be scheduled.
++
++        This method checks two conditions:
++        1. The drainer allows scheduling (based on draining state)
++        2. The LoRA adapter can be loaded (either already running or can be added)
++        """
++        if self.lora_drainer and not self.lora_drainer.can_schedule(req):
++            return False
++
++        if req.lora_id in running_loras:
++            return True
++
++        if self.enable_lora_overlap_loading:
++            # For overlapping loading of LoRA weights with computation, we will load each
++            # adapter one at a time, as opposed to loading them in one batch
++            return self.lora_overlap_loader.try_overlap_load_lora(
++                req.lora_id, running_loras
++            )
++        else:
++            new_lora_set = {req.lora_id} | running_loras
++            return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
++                new_lora_set
++            )
++
++    def _b300_v9_native_recovery_prefill(
+         self,
+         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
+         running_batch: ScheduleBatch,
+@@ -3450,35 +3482,7 @@
+ 
+         return new_batch, running_batch
+ 
+-    def _can_schedule_lora_req(
+-        self, req: Req, running_loras: set[Optional[str]]
+-    ) -> bool:
+-        """
+-        Check if a LoRA request can be scheduled.
+-
+-        This method checks two conditions:
+-        1. The drainer allows scheduling (based on draining state)
+-        2. The LoRA adapter can be loaded (either already running or can be added)
+-        """
+-        if self.lora_drainer and not self.lora_drainer.can_schedule(req):
+-            return False
+-
+-        if req.lora_id in running_loras:
+-            return True
+-
+-        if self.enable_lora_overlap_loading:
+-            # For overlapping loading of LoRA weights with computation, we will load each
+-            # adapter one at a time, as opposed to loading them in one batch
+-            return self.lora_overlap_loader.try_overlap_load_lora(
+-                req.lora_id, running_loras
+-            )
+-        else:
+-            new_lora_set = {req.lora_id} | running_loras
+-            return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
+-                new_lora_set
+-            )
+-
+-    def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
++    def _b300_v9_check_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+         """Update the current running decoding batch."""
+         initial_bs = batch.batch_size()
+ 
+@@ -3560,6 +3564,90 @@
+             return batch
+ 
+         # Update batch tensors
++        return batch
++
++    def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
++        """Update the current running decoding batch."""
++        initial_bs = batch.batch_size()
++
++        batch.filter_batch()
++        if batch.is_empty():
++            batch.batch_is_full = False
++            return batch
++
++        # Check if decode out of memory
++        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
++            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
++        ):
++            old_available_tokens = self.token_to_kv_pool_allocator.available_size()
++            old_ratio = self.new_token_ratio_tracker.current
++            mamba_allocator = getattr(
++                self.tree_cache.req_to_token_pool, "mamba_allocator", None
++            )
++            old_mamba_available = (
++                mamba_allocator.available_size()
++                if mamba_allocator is not None
++                else None
++            )
++            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
++                self.server_args
++            )
++            new_available_tokens = self.token_to_kv_pool_allocator.available_size()
++            new_token_gained = new_available_tokens - old_available_tokens
++            mamba_num_gained = (
++                mamba_allocator.available_size() - old_mamba_available
++                if mamba_allocator is not None
++                else None
++            )
++
++            self.metrics_reporter.num_retracted_reqs = len(retracted_reqs)
++            if self.metrics_reporter.enable_metrics and len(retracted_reqs) > 0:
++                self.metrics_reporter.metrics_collector.increment_retracted_reqs(
++                    num_retracted_reqs=len(retracted_reqs),
++                    num_retracted_input_tokens=sum(
++                        len(r.origin_input_ids) for r in retracted_reqs
++                    ),
++                    num_retracted_output_tokens=sum(
++                        len(r.output_ids) for r in retracted_reqs
++                    ),
++                )
++            self.new_token_ratio_tracker.current = new_token_ratio
++            for req in reqs_to_abort:
++                abort_reason: FINISH_ABORT = req.to_finish
++                self.ipc_channels.send_to_tokenizer.send_output(
++                    AbortReq(
++                        finished_reason=abort_reason.to_json(),
++                        rid=req.rid,
++                    ),
++                    req,
++                )
++
++            msg_prefix = (
++                "KV cache pool is full. Retract requests. "
++                if kv_full_retract_flag
++                else "Testing retraction. "
++            )
++            msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
++            if mamba_num_gained is not None:
++                msg_details += f", #mamba_num_gained: {mamba_num_gained}"
++            if kv_full_retract_flag:
++                msg_details += (
++                    f", #new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
++                )
++            logger.warning(msg_prefix + msg_details)
++
++            for req in retracted_reqs:
++                self._add_request_to_queue(req, is_retracted=True)
++        else:
++            self.new_token_ratio_tracker.decay_step()
++
++        if batch.batch_size() < initial_bs:
++            batch.batch_is_full = False
++
++        if batch.is_empty():
++            return batch
++
++        # Update batch tensors
+         batch.prepare_for_decode()
+         return batch
+ 
+@@ -3691,9 +3779,17 @@
+                                 )
+ 
+                         # FIXME: pp is not compatible with overlap
++                        if _PersistentDispatch.is_page(self):
++                            _PersistentDispatch.note_launch(self, batch)
++                            page_start = self.device_module.Event(enable_timing=True)
++                            page_end = self.device_module.Event(enable_timing=True)
++                            page_start.record(stream=self.forward_stream)
+                         batch_result = self.model_worker.forward_batch_generation(
+                             batch, **fwd_kwargs
+                         )
++                        if _PersistentDispatch.is_page(self):
++                            page_end.record(stream=self.forward_stream)
++                            batch.b300_page_timing = (page_start, page_end)
+                         if batch.spec_algorithm.is_none():
+                             self.future_map.publish(future_indices, batch.seq_lens + 1)
+                         # Park any refs the worker wants kept alive 2 iters
+@@ -3943,6 +4039,7 @@
+         elif batch.forward_mode.is_idle():
+             self.batch_result_processor.process_batch_result_idle(batch, result)
+ 
++        _PersistentDispatch.note_result(self, batch, result)
+         self._record_step_counters(batch, result)
+ 
+         self.metrics_reporter.log_batch_result_stats(batch, result)
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -2031,6 +2031,11 @@
+     chunked_req: Optional[Req] = None
+     chunked_req_next_prompt_token: Optional[int] = None
+     contains_last_prefill_chunk: bool = True
++    b300_page_partials: tuple = ()
++    b300_v9_recovery: bool = False
++    b300_page_features: Optional[tuple] = None
++    b300_page_decoders: int = 0
++    b300_page_timing: Optional[tuple] = None
+ 
+     # For DP attention
+     inner_idle_batch: Optional[ScheduleBatch] = None
+@@ -2811,7 +2816,10 @@
+         whether the next decode step fits in the KV pool."""
+         num_tokens = self.new_tokens_required_next_decode(selected_indices)
+         evict_from_tree_cache(self.tree_cache, num_tokens)
+-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
++        from sglang.srt.managers.b300_persistent_dispatch_rollout_v12 import synchronize_decode_memory
++        return synchronize_decode_memory(
++            self, self.token_to_kv_pool_allocator.available_size() >= num_tokens,
++            selected_indices=selected_indices)
+ 
+     def retract_decode(
+         self, server_args: ServerArgs
+@@ -3319,6 +3327,11 @@
+             launch_ts=self.launch_ts,
+             after_idle_gap=self.after_idle_gap,
+             extend_num_tokens=self.extend_num_tokens,
++            b300_page_partials=self.b300_page_partials,
++            b300_v9_recovery=self.b300_v9_recovery,
++            b300_page_features=self.b300_page_features,
++            b300_page_decoders=self.b300_page_decoders,
++            b300_page_timing=self.b300_page_timing,
+         )
+ 
+     def maybe_evict_swa(self):
+--- a/python/sglang/srt/managers/schedule_policy.py
++++ b/python/sglang/srt/managers/schedule_policy.py
+@@ -200,6 +200,7 @@
+ class CacheAwarePolicy(Enum):
+     """Scheduling policies that are aware of the tree cache."""
+ 
++    PQ_AGING = "pq-aging"  # fixed prefill priority + aging
+     LPM = "lpm"  # longest prefix match
+     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
+ 
+@@ -233,10 +234,20 @@
+ 
+         # It is used to find the matching prefix for in-batch prefix caching.
+         self.waiting_queue_radix_tree = RadixCache.create_simulated()
++        if policy == "pq-aging":
++            if not enable_hierarchical_cache or enable_priority_scheduling:
++                raise ValueError("PQ requires HiCache and native priority scheduling disabled")
++            if self.policy != CacheAwarePolicy.PQ_AGING:
++                raise ValueError("PQ radix cache must be enabled")
++            from sglang.srt.managers.b300_pq_schedule_policy import NativePQAging
++            self._b300_pq = NativePQAging(self.tree_cache, match_prefix_for_req, torch)
+ 
+     def calc_priority(
+         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
+     ) -> None:
++        if self.policy == CacheAwarePolicy.PQ_AGING:
++            self._b300_pq.order(waiting_queue)
++            return
+         policy = self._determine_active_policy(waiting_queue)
+ 
+         # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations
++from sglang.srt.managers import b300_persistent_dispatch_rollout_v12 as _PersistentDispatch
+ 
+ import logging
+ from dataclasses import dataclass
+@@ -262,7 +263,7 @@
+                     # drain its accounting without streaming it.
+                     continue
+ 
+-                if req.inflight_middle_chunks <= 0:
++                if (req not in batch.b300_page_partials if _PersistentDispatch.is_page() else req.inflight_middle_chunks <= 0):
+                     req.time_stats.set_prefill_finished_time()
+ 
+                     # req output_ids are set here
+@@ -364,7 +365,9 @@
+ 
+         self.token_to_kv_pool_allocator.free_group_end()
+         self.output_streamer.stream_output(
+-            batch.reqs, batch.return_logprob, skip_stream_req
++            ([req for req in batch.reqs if req not in batch.b300_page_partials]
++             if _PersistentDispatch.is_page() else batch.reqs),
++            batch.return_logprob, (None if _PersistentDispatch.is_page() else skip_stream_req)
+         )
+ 
+         can_run_cuda_graph = result.can_run_cuda_graph
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -830,6 +830,7 @@
+         Arg(
+             help="The scheduling policy of the requests.",
+             choices=[
++                "pq-aging",
+                 "lpm",
+                 "random",
+                 "fcfs",
