@@ -161,7 +161,8 @@ The planner is method `b01`. Caesura adds `b01_ext`.
 
 The workloads replay L-Eval questions (clock 36× in Table 2, 90× on Qwen3) and a 30% sample of the Mooncake
 tool-agent trace. The token IDs in `gpu/workloads/` encode L-Eval text and keep its GPL-3.0 license
-(`gpu/workloads/LICENSE.LEval`). The Mooncake trace and our code are under Apache-2.0.
+(`gpu/workloads/LICENSE.LEval`). The Mooncake trace and `gpu/sglang_hooks.patch`, which modifies SGLang, keep their
+Apache-2.0 license (`LICENSES/Apache-2.0.txt`). All other code is under the MIT license (`LICENSE`).
 
 ## Citation
 
